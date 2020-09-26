@@ -1,0 +1,47 @@
+
+
+model
+{
+  for (j in 1 : 9) {
+    for (i in (IND[j] + 1) : IND[j+1]) {
+    
+    # Weibull: Parametric Survival Model
+    is.censored[i] ~ dinterval(t[i], t.cen[i])
+    t[i] ~ dweib(shape, scale[i])
+    
+    log(scale[i]) <- tRACE[RACE[i]] + tPRIMARY_SITE[PRIMARY_SITE[i]] + 
+                     tGRADE[GRADE[i]] + theta[1]*AGE[i] + theta[2]*SIZE[i] +
+                     theta[3]*NODES[i] + theta[4]*EXTENSION[i] + b[j]
+    
+    ### calculate log-likelihoods
+    s[i] <- ifelse(is.censored[i], t.cen[i], t[i])
+    loglik[i] <- log(ifelse(is.censored[i],
+                    exp(-scale[i]*(s[i]^shape)),
+                    shape*scale[i]*(s[i]^(shape - 1))*exp(-scale[i]*(s[i]^shape))))
+  }
+  # Random effects:
+  b[j] ~ dnorm(0, 1/sigma)
+  }
+  
+  # Priors:
+  
+  tRACE[1] <- 0
+  tRACE[2] ~ dnorm(0,0.0001)
+  
+  tGRADE[1] <- 0
+  tGRADE[2] ~ dnorm(0,0.0001)
+  tGRADE[3] ~ dnorm(0,0.0001)
+  
+  tPRIMARY_SITE[1] <- 0
+  tPRIMARY_SITE[2] ~ dnorm(0,0.0001)
+  
+  for (j in 1:4){
+    theta[j] ~ dnorm(0,0.0001)
+  }
+  
+  shape ~ dgamma(2,1)
+  
+  # Random effects 
+  tau ~ dgamma(0.001, 0.001)
+  sigma <- 1/tau
+}

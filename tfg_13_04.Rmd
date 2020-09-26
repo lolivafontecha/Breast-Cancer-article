@@ -1,0 +1,818 @@
+---
+title: "A Breast Cancer Survability Study"
+output:
+  html_notebook:
+    theme: united
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+
+# I. Importing data and libraries
+```{r libraries and data import, message=FALSE, warning=FALSE, include=FALSE}
+library(purrr) # for functionals
+library(MASS) # for chi-square
+library(dplyr) # for select, filter, summarize, etc.
+library(coda) # for convergence study of mcmc methods
+library(rjags)
+library(R2jags)
+library(loo) # to compute WAIC
+library(mice) # for imputation
+library(rgdal)
+library(matrixStats)
+
+set.seed(20) # for reproducible example
+
+setwd("C:/Users/Luis/Desktop/TFG/final version")
+
+#dataset considering the recurrent cases
+breast_rec.ori <- read.table("Breast_cleaned_recurrence.csv", 
+                             sep = ",", header = TRUE)
+
+#dataset not considering the recurrent cases
+breast_no_rec.ori <- read.table("Breast_cleaned_no_recurrence.csv", 
+                                sep = ",", header = TRUE)
+```
+
+
+# II. Data cleaning and preparation
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# re-ordering of the variables to differentiate quantitative and qualitative variables
+breast_no_rec.ori <- breast_no_rec.ori[, c(1,5,21:22,3,2,8:10,20,16,15,6:7,
+                                           4,11:12,14,13,17:19)] 
+breast_no_rec.ori$SEQ_NUM <- NULL # not really a predictor variable, just to check is not recurrent
+
+breast_no_rec <- breast_no_rec.ori # we keep the original dataset
+
+breast_no_rec$STATE <- factor(breast_no_rec$STATE, levels = c(9,26,15,19,35,6,49,53,13),
+                              labels = c("CONNECTICUT", "MICHIGAN", "HAWAII", "IOWA",
+                                         "NEW_MEXICO", "CALIFORNIA", "UTAH", 
+                                         "WASHINGTON", "GEORGIA"))
+breast_no_rec$RACE <- factor(breast_no_rec$RACE, levels = c(1,2,3), 
+                             labels = c("WHITE", "BLACK", "OTHER"))
+breast_no_rec$GENDER <- factor(breast_no_rec$GENDER, levels = c(1,2), 
+                               labels = c("MALE", "FEMALE"))
+breast_no_rec$BEHAVIOR <- factor(breast_no_rec$BEHAVIOR, levels = c(2,3), 
+                                 labels = c("NON_INVASIVE", "MALIGNANT"))
+breast_no_rec$LATERAL <- factor(breast_no_rec$LATERAL, levels = c(1,2,3,4), 
+                                labels = c("RIGHT", "LEFT", "ONE_SIDE", "BILATERAL"))
+breast_no_rec$STAGE <- factor(breast_no_rec$STAGE, levels = c(0,1,2,4), 
+                                labels = c("IN-SITU", "LOCALIZED", "REGIONAL", "DISTANT"))
+breast_no_rec$SURGERY <- factor(breast_no_rec$SURGERY, levels = c(0,1), 
+                                labels = c("YES", "NO"))
+breast_no_rec$GRADE <- factor(breast_no_rec$GRADE, levels = c(1,2,3,4),
+                              labels = c("WELL_DIFFERENTIATED", "MODERATELY_DIFFERENTIATED",
+                                         "POORLY_DIFFERENTIATED", "UNDIFFERENTIATED"))
+breast_no_rec$DEATH <- factor(breast_no_rec$DEATH, levels = c(0,1,8), 
+                              labels = c("OTHER_OR_ALIVE", "CANCER",
+                                         "UNKNOWN_REASON"))
+breast_no_rec$VITAL_STAT <- factor(breast_no_rec$VITAL_STAT, levels = c(0,1),
+                                   labels = c("DEAD", "ALIVE"))
+
+# breast_no_rec <- breast_no_rec %>% filter(!(VITAL_STAT=="DEAD" & DEATH=="OTHER_OR_ALIVE"))
+
+# as.factor for categoric variables
+breast_no_rec$STATE_COUNTY <- as.factor(breast_no_rec$STATE_COUNTY)
+breast_no_rec$STATE <- as.factor(breast_no_rec$STATE)
+breast_no_rec$RACE <- as.factor(breast_no_rec$RACE)
+breast_no_rec$GENDER <- as.factor(breast_no_rec$GENDER)
+breast_no_rec$PRIMARY_SITE <- as.factor(breast_no_rec$PRIMARY_SITE)
+breast_no_rec$LATERAL <- as.factor(breast_no_rec$LATERAL)
+breast_no_rec$BEHAVIOR <- as.factor(breast_no_rec$BEHAVIOR)
+breast_no_rec$STAGE <- as.factor(breast_no_rec$STAGE)
+breast_no_rec$SURGERY <- as.factor(breast_no_rec$SURGERY)
+breast_no_rec$GRADE <- as.factor(breast_no_rec$GRADE)
+breast_no_rec$VITAL_STAT <- as.factor(breast_no_rec$VITAL_STAT)
+breast_no_rec$DEATH <- as.factor(breast_no_rec$DEATH)
+
+# we drop, for the moment, the county of the patient
+breast_no_rec$COUNTY <- NULL
+# we also drop the patient id for privacy ethics
+breast_no_rec$PATIENT_ID <- NULL
+
+# CENSORING, NODES AND Y creation
+cens_funct <- function(x,y) {
+  if ((x == "DEAD") & (y == "CANCER")) {
+    # dead and because of cancer
+    return(1)
+  }
+    return(0)
+}
+
+zero_funct <- function(x) {
+  if (x == 0) {
+    return(1)
+  }
+  return(0)
+}
+
+nod_funct <- function(x,y) {
+  if(y == 0) {
+    return(0)
+  } else {
+    return(x/y)
+  }
+}
+
+# we replace nod_ex and nod_pos by their ratio
+breast_no_rec <- breast_no_rec %>% mutate(NODES = map2_dbl(NOD_POS, NOD_EX, nod_funct))
+
+# we create the censoring column
+breast_no_rec <- breast_no_rec %>% mutate(CENSORING = map2_dbl(VITAL_STAT, DEATH, cens_funct))
+
+# we create the Y variable: indicator of 0 survival months
+# breast_no_rec <- breast_no_rec %>% mutate(Y = map_dbl(SURVIVAL_MONTHS, zero_funct))
+breast_no_rec$SURVIVAL_MONTHS[breast_no_rec$SURVIVAL_MONTHS==0] <- 0.001
+
+breast_no_rec$VITAL_STAT <- NULL # not useful anymore
+breast_no_rec$DEATH <- NULL # not useful anymore
+breast_no_rec$NOD_EX <- NULL # not useful anymore
+breast_no_rec$NOD_POS <- NULL # not useful anymore
+
+# we are just dropping 102 cases out of 394639 cases
+breast_no_rec <- breast_no_rec %>% filter(LATERAL != "ONE_SIDE" & LATERAL != "BILATERAL") 
+breast_no_rec$LATERAL <- droplevels(breast_no_rec$LATERAL)
+
+# re-ordering of the variables
+breast_no_rec <- breast_no_rec[, c(1:14, 16, 15, 17)]
+
+# solo malignant tumors y surgery yes
+breast_no_rec <- breast_no_rec %>% filter(BEHAVIOR=="MALIGNANT" & SURGERY=="YES")
+breast_no_rec$BEHAVIOR <- NULL
+breast_no_rec$SURGERY <- NULL
+breast_no_rec$STAGE <- droplevels(breast_no_rec$STAGE)
+
+breast_no_rec$STATE_COUNTY <- NULL
+
+# quitamos los cases con errores en tumor size para female
+breast_no_rec <- breast_no_rec %>% filter(GENDER =="MALE" | (GENDER=="FEMALE" & SIZE <= 200))
+
+# separamos por genero
+fbreast_no_rec <- breast_no_rec %>% filter(GENDER == "FEMALE")
+
+mbreast_no_rec <- breast_no_rec %>% filter(GENDER == "MALE")
+
+# # imputation para valores erroneos of tumor size
+mbreast_no_rec$SIZE[mbreast_no_rec$SIZE > 200] <- NA
+mbmice <- mice(mbreast_no_rec[,c(1:12)], method="pmm")
+mbreast_no_rec_copy <- complete(mbmice, include=FALSE)
+mbreast_no_rec <- cbind(mbreast_no_rec_copy,
+                        mbreast_no_rec[,13:14])
+```
+
+Merging Categories: (RACE, PRIMARY SITE, GRADE)
+```{r}
+mbreast_no_rec$RACE <- factor(mbreast_no_rec$RACE, 
+                              levels = c("WHITE","BLACK", "OTHER"), 
+                              labels = c("WHITE", "OTHER", "OTHER"))
+fbreast_no_rec$RACE <- factor(fbreast_no_rec$RACE, 
+                              levels = c("WHITE","BLACK", "OTHER"), 
+                              labels = c("WHITE", "OTHER", "OTHER"))
+
+mbreast_no_rec$PRIMARY_SITE <- factor(mbreast_no_rec$PRIMARY_SITE, 
+                                   levels = c("C500", "C501", "C502",
+                                              "C503", "C504", "C505",
+                                              "C506", "C508","C509"),
+                                   labels = c("OTHER", "C501", "OTHER", 
+                                              "OTHER", "OTHER", "OTHER",
+                                              "OTHER", "C508", "C509"))
+
+fbreast_no_rec$PRIMARY_SITE <- factor(fbreast_no_rec$PRIMARY_SITE, 
+                                   levels = c("C500", "C501", "C502",
+                                              "C503", "C504", "C505",
+                                              "C506", "C508","C509"),
+                                   labels = c("OTHER", "OTHER", "OTHER", 
+                                              "OTHER", "C504", "OTHER",
+                                              "OTHER", "C508", "C509"))
+
+mbreast_no_rec$GRADE <- factor(mbreast_no_rec$GRADE, 
+                               levels = c("WELL_DIFFERENTIATED",
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY_DIFFERENTIATED",
+                                          "UNDIFFERENTIATED"), 
+                               labels = c("WELL_DIFFERENTIATED", 
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED"))
+
+fbreast_no_rec$GRADE <- factor(fbreast_no_rec$GRADE, 
+                               levels = c("WELL_DIFFERENTIATED",
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY_DIFFERENTIATED",
+                                          "UNDIFFERENTIATED"), 
+                               labels = c("WELL_DIFFERENTIATED", 
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED"))
+
+```
+
+## FEMALE:
+ 
+REFIT DISTANT:
+
+```{r}
+fbreast_no_rec_dist <- fbreast_no_rec %>% filter(STAGE=="DISTANT")
+```
+
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# centrate diagnostic year
+fbreast_no_rec_dist$DIAGNOSTIC_YEAR <- fbreast_no_rec_dist$DIAGNOSTIC_YEAR - mean(fbreast_no_rec_dist$DIAGNOSTIC_YEAR)
+
+# log transformation for age, EXTENSIONsion and tumor size
+fbreast_no_rec_dist$SIZE <- log(fbreast_no_rec_dist$SIZE + 1) # + 1 because of the values = 0
+fbreast_no_rec_dist$EXTENSION <- log(fbreast_no_rec_dist$EXTENSION + 1) # + 1 because of the values = 0
+fbreast_no_rec_dist$AGE <- log(fbreast_no_rec_dist$AGE)
+
+fbreast_no_rec_dist$CENSORING1 <- fbreast_no_rec_dist$CENSORING
+fbreast_no_rec_dist <- fbreast_no_rec_dist %>% arrange(STATE)
+
+is.censored <- 1 - fbreast_no_rec_dist$CENSORING
+
+fbreast_no_rec_dist$CENSORING[fbreast_no_rec_dist$CENSORING == 1] <- fbreast_no_rec_dist$SURVIVAL_MONTHS[fbreast_no_rec_dist$CENSORING == 1] + 1
+mcopia <- fbreast_no_rec_dist$SURVIVAL_MONTHS[fbreast_no_rec_dist$CENSORING == 0] 
+fbreast_no_rec_dist$SURVIVAL_MONTHS[fbreast_no_rec_dist$CENSORING == 0] <- NA
+fbreast_no_rec_dist$CENSORING[fbreast_no_rec_dist$CENSORING == 0] <- mcopia
+
+t <- fbreast_no_rec_dist$SURVIVAL_MONTHS
+t.cen <- fbreast_no_rec_dist$CENSORING
+
+load.module("glm")
+N <- nrow(fbreast_no_rec_dist)
+```
+
+```{r}
+fbreast_no_rec_dist$PRIMARY_SITE <- factor(fbreast_no_rec_dist$PRIMARY_SITE, 
+                                   levels = c("OTHER", "C504", "C508", "C509"),
+                                   labels = c("OTHER", "OTHER", "OTHER", "C509"))
+
+IND <- c(0, 990, 2368, 2720, 3775, 4294, 5441, 5973, 7092, N)
+
+attach(fbreast_no_rec_dist)
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "EXTENSION"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tGRADE"=c(NA,1,1),
+                        "tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_dist <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "tRACE",
+                                                  "scale", "tPRIMARY_SITE",
+                                                  "theta", "b", "loglik"),
+                           n.chains = 2,
+                           n.iter = 1000,
+                           n.burnin = 100,
+                           n.thin = 10,
+                           model.file = "model_refit_1_female_mal.bug")
+
+weibull.paramlist.dist <- model_refit_dist$BUGSoutput$sims.list
+weibull.loglik.dist <- weibull.paramlist.dist$loglik
+weibull.waic.dist <- waic(weibull.loglik.dist)
+print(weibull.waic.dist)
+
+model_refit.dist <- jags.model("model_refit_1_female_mal.bug", data=data,
+                          inits=data_Inits, n.chains = 2)
+update(model_refit.dist, 100)
+dic_t_dist <- dic.samples(model_refit.dist,
+                     variable.names=c("tRACE",
+                                      "tGRADE",
+                                      "theta", "b", "tPRIMARY_SITE",
+                                      "tSTAGE_EXTENSION",
+                                      "loglik"),
+                     thin=5, n.burnin=100, n.iter=1000)
+print(dic_t_dist)
+
+```
+
+
+
+
+REFIT REGIONAL:
+```{r}
+detach(fbreast_no_rec_dist)
+fbreast_no_rec_reg <- fbreast_no_rec %>% filter(STAGE=="REGIONAL")
+```
+
+
+```{r}
+# centrate diagnostic year
+fbreast_no_rec_reg$DIAGNOSTIC_YEAR <- fbreast_no_rec_reg$DIAGNOSTIC_YEAR - mean(fbreast_no_rec_reg$DIAGNOSTIC_YEAR)
+
+# log transformation for age, EXTENSIONsion and tumor size
+fbreast_no_rec_reg$SIZE <- log(fbreast_no_rec_reg$SIZE + 1) # + 1 because of the values = 0
+fbreast_no_rec_reg$EXTENSION <- log(fbreast_no_rec_reg$EXTENSION + 1) # + 1 because of the values = 0
+fbreast_no_rec_reg$AGE <- log(fbreast_no_rec_reg$AGE)
+
+fbreast_no_rec_reg$CENSORING1 <- fbreast_no_rec_reg$CENSORING
+fbreast_no_rec_reg <- fbreast_no_rec_reg %>% arrange(STATE)
+
+is.censored <- 1 - fbreast_no_rec_reg$CENSORING
+
+fbreast_no_rec_reg$CENSORING[fbreast_no_rec_reg$CENSORING == 1] <- fbreast_no_rec_reg$SURVIVAL_MONTHS[fbreast_no_rec_reg$CENSORING == 1] + 1
+mcopia <- fbreast_no_rec_reg$SURVIVAL_MONTHS[fbreast_no_rec_reg$CENSORING == 0] 
+fbreast_no_rec_reg$SURVIVAL_MONTHS[fbreast_no_rec_reg$CENSORING == 0] <- NA
+fbreast_no_rec_reg$CENSORING[fbreast_no_rec_reg$CENSORING == 0] <- mcopia
+
+t <- fbreast_no_rec_reg$SURVIVAL_MONTHS
+t.cen <- fbreast_no_rec_reg$CENSORING
+
+load.module("glm")
+N <- nrow(fbreast_no_rec_reg)
+```
+
+```{r}
+# this part of the code has to be modified for each of the models fitted
+fbreast_no_rec_reg$PRIMARY_SITE <- factor(fbreast_no_rec_reg$PRIMARY_SITE, 
+                                   levels = c("OTHER", "C504", "C508", "C509"),
+                                   labels = c("OTHER", "C504", "OTHER", "C509"))
+
+IND <- c(0, 13627, 29288, 33873, 45376, 51567, 67923, 74820, 91839, N)
+
+attach(fbreast_no_rec_reg)
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "EXTENSION"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE, "DIAG_YR"=DIAGNOSTIC_YEAR,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(5,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(5,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_reg <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_2_female_mal.bug")
+
+weibull.paramlist.reg <- model_refit_reg$BUGSoutput$sims.list
+weibull.loglik.reg <- weibull.paramlist.reg$loglik
+weibull.waic.reg <- waic(weibull.loglik.reg)
+print(weibull.waic.reg)
+
+model_refit.reg <- jags.model("model_refit_2_female_mal.bug", data=data,
+                          inits=data_Inits, n.chains = 2)
+update(model_refit.reg, 100)
+dic_t_reg <- dic.samples(model_refit.reg,
+                     variable.names=c("tGRADE",
+                                      "tRACE",
+                                      "theta", "b", 
+                                      "tPRIMARY_SITE","loglik"),
+                     thin=10, n.burnin=100, n.iter=1000)
+print(dic_t_reg)
+
+```
+2ND OPTION FOR REGIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "VAR"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_reg_2 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 1000,
+                           n.burnin = 100,
+                           n.thin = 10,
+                           model.file = "model_refit_2_1_female_mal.bug")
+
+weibull.paramlist.reg.2 <- model_refit_reg_2$BUGSoutput$sims.list
+weibull.loglik.reg.2 <- weibull.paramlist.reg.2$loglik
+weibull.waic.reg.2 <- waic(weibull.loglik.reg.2)
+print(weibull.waic.reg.2)
+
+model_refit.reg.2 <- jags.model("model_refit_2_1_female_mal.bug", data=data,
+                          inits=data_Inits, n.chains = 2)
+update(model_refit.reg.2, 100)
+dic_t_reg_2 <- dic.samples(model_refit.reg.2,
+                     variable.names=c("tGRADE",
+                                      "tRACE",
+                                      "theta", "b", 
+                                      "tPRIMARY_SITE","loglik"),
+                     thin=10, n.burnin=100, n.iter=1000)
+print(dic_t_reg_2)
+```
+
+3RD OPTION FOR REGIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "VAR"=DIAGNOSTIC_YEAR, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_reg_3 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_2_1_female_mal.bug")
+
+weibull.paramlist.reg.3 <- model_refit_reg_3$BUGSoutput$sims.list
+weibull.loglik.reg.3 <- weibull.paramlist.reg.3$loglik
+weibull.waic.reg.3 <- waic(weibull.loglik.reg.3)
+print(weibull.waic.reg.3)
+
+# model_refit.reg.3 <- jags.model("model_refit_2_1_female_mal.bug", data=data,
+#                           inits=data_Inits, n.chains = 2)
+# update(model_refit.reg.3, 100)
+# dic_t_reg_3 <- dic.samples(model_refit.reg.3,
+#                      variable.names=c("tGRADE",
+#                                       "tRACE",
+#                                       "theta", "b", 
+#                                       "tPRIMARY_SITE","loglik"),
+#                      thin=10, n.burnin=100, n.iter=1000)
+# print(dic_t_reg_3)
+```
+4TH OPTION FOR REGIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "EXTENSION"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE, "DIAG_YR"=DIAGNOSTIC_YEAR,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(6,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(6,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_reg_4 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_2_2_female_mal.bug")
+
+weibull.paramlist.reg.4 <- model_refit_reg_4$BUGSoutput$sims.list
+weibull.loglik.reg.4 <- weibull.paramlist.reg.4$loglik
+weibull.waic.reg.4 <- waic(weibull.loglik.reg.4)
+print(weibull.waic.reg.4)
+
+# model_refit.reg.4 <- jags.model("model_refit_2_2_female_mal.bug", data=data,
+#                           inits=data_Inits, n.chains = 2)
+# update(model_refit.reg.4, 100)
+# dic_t_reg_4 <- dic.samples(model_refit.reg.4,
+#                      variable.names=c("tGRADE",
+#                                       "tRACE",
+#                                       "theta", "b", 
+#                                       "tPRIMARY_SITE","loglik"),
+#                      thin=10, n.burnin=100, n.iter=1000)
+# print(dic_t_reg_4)
+```
+REFIT LOCALIZED:
+```{r}
+detach(fbreast_no_rec_reg)
+fbreast_no_rec_loc <- fbreast_no_rec %>% filter(STAGE=="LOCALIZED")
+```
+
+
+```{r}
+# centrate diagnostic year
+fbreast_no_rec_loc$DIAGNOSTIC_YEAR <- fbreast_no_rec_loc$DIAGNOSTIC_YEAR - mean(fbreast_no_rec_loc$DIAGNOSTIC_YEAR)
+
+# log transformation for age, EXTENSIONsion and tumor size
+fbreast_no_rec_loc$SIZE <- log(fbreast_no_rec_loc$SIZE + 1) # + 1 because of the values = 0
+fbreast_no_rec_loc$EXTENSION <- log(fbreast_no_rec_loc$EXTENSION + 1) # + 1 because of the values = 0
+fbreast_no_rec_loc$AGE <- log(fbreast_no_rec_loc$AGE)
+
+fbreast_no_rec_loc$CENSORING1 <- fbreast_no_rec_loc$CENSORING
+fbreast_no_rec_loc <- fbreast_no_rec_loc %>% arrange(STATE)
+
+is.censored <- 1 - fbreast_no_rec_loc$CENSORING
+
+fbreast_no_rec_loc$CENSORING[fbreast_no_rec_loc$CENSORING == 1] <- fbreast_no_rec_loc$SURVIVAL_MONTHS[fbreast_no_rec_loc$CENSORING == 1] + 1
+mcopia <- fbreast_no_rec_loc$SURVIVAL_MONTHS[fbreast_no_rec_loc$CENSORING == 0] 
+fbreast_no_rec_loc$SURVIVAL_MONTHS[fbreast_no_rec_loc$CENSORING == 0] <- NA
+fbreast_no_rec_loc$CENSORING[fbreast_no_rec_loc$CENSORING == 0] <- mcopia
+
+t <- fbreast_no_rec_loc$SURVIVAL_MONTHS
+t.cen <- fbreast_no_rec_loc$CENSORING
+
+load.module("glm")
+N <- nrow(fbreast_no_rec_loc)
+```
+
+```{r}
+# this part of the code has to be modified for each of the models fitted
+fbreast_no_rec_loc$PRIMARY_SITE <- factor(fbreast_no_rec_loc$PRIMARY_SITE, 
+                                   levels = c("OTHER", "C504", "C508", "C509"),
+                                   labels = c("OTHER", "C504", "C508", "OTHER"))
+
+fbreast_no_rec_loc <- fbreast_no_rec_loc[sample(c(1:N), 100000, replace = FALSE)
+,]
+# IND <- c(0, 46282, 94006, 110266, 148738, 167911, 221261, 241380, 297498, N)
+N <- 100000
+IND <- c(0, 14489, 28541, 33739, 45340, 51095, 67456, 73232, 90547, N)
+attach(fbreast_no_rec_loc)
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "EXTENSION"=EXTENSION, "SIZE"=SIZE, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE, "DIAG_YR"=DIAGNOSTIC_YEAR,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_loc <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_2_female_mal.bug")
+
+weibull.paramlist.loc <- model_refit_loc$BUGSoutput$sims.list
+weibull.loglik.loc <- weibull.paramlist.loc$loglik
+weibull.waic.loc <- waic(weibull.loglik.loc)
+print(weibull.waic.loc)
+
+model_refit.loc <- jags.model("model_refit_2_female_mal.bug", data=data,
+                          inits=data_Inits, n.chains = 2)
+update(model_refit.loc, 50)
+dic_t_loc <- dic.samples(model_refit.loc,
+                     variable.names=c("tGRADE",
+                                      "tRACE",
+                                      "theta", "b", 
+                                      "tPRIMARY_SITE","loglik"),
+                     thin=5, n.burnin=10, n.iter=500)
+print(dic_t_loc)
+```
+2ND OPTION FOR locIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "VAR"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_loc_2 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_3_1_female_mal.bug")
+
+weibull.paramlist.loc.2 <- model_refit_loc_2$BUGSoutput$sims.list
+weibull.loglik.loc.2 <- weibull.paramlist.loc.2$loglik
+weibull.waic.loc.2 <- waic(weibull.loglik.loc.2)
+print(weibull.waic.loc.2)
+
+# model_refit.loc.2 <- jags.model("model_refit_2_1_female_mal.bug", data=data,
+#                           inits=data_Inits, n.chains = 2)
+# update(model_refit.loc.2, 100)
+# dic_t_loc_2 <- dic.samples(model_refit.loc.2,
+#                      variable.names=c("tGRADE",
+#                                       "tRACE",
+#                                       "theta", "b", 
+#                                       "tPRIMARY_SITE","loglik"),
+#                      thin=10, n.burnin=100, n.iter=1000)
+# print(dic_t_loc_2)
+```
+
+3RD OPTION FOR locIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "VAR"=DIAGNOSTIC_YEAR, "SIZE"=SIZE, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(4,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(4,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_loc_3 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_3_1_female_mal.bug")
+
+weibull.paramlist.loc.3 <- model_refit_loc_3$BUGSoutput$sims.list
+weibull.loglik.loc.3 <- weibull.paramlist.loc.3$loglik
+weibull.waic.loc.3 <- waic(weibull.loglik.loc.3)
+print(weibull.waic.loc.3)
+
+# model_refit.loc.3 <- jags.model("model_refit_2_1_female_mal.bug", data=data,
+#                           inits=data_Inits, n.chains = 2)
+# update(model_refit.loc.3, 100)
+# dic_t_loc_3 <- dic.samples(model_refit.loc.3,
+#                      variable.names=c("tGRADE",
+#                                       "tRACE",
+#                                       "theta", "b", 
+#                                       "tPRIMARY_SITE","loglik"),
+#                      thin=10, n.burnin=100, n.iter=1000)
+# print(dic_t_loc_3)
+```
+4TH OPTION FOR locIONAL:
+```{r}
+data <-list("RACE"=RACE, "GRADE"=GRADE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "EXTENSION"=EXTENSION, "SIZE"=SIZE, "NODES"=NODES, 
+            "t"=t, "t.cen"=t.cen, "AGE"=AGE, "DIAG_YR"=DIAGNOSTIC_YEAR,
+            "is.censored"=is.censored, "IND"=IND)
+
+data_Inits <- list(list("tRACE"=c(NA,1),
+                        "tPRIMARY_SITE" = c(NA,1,1),
+                        "tGRADE"=c(NA,1,1),
+                        "theta"=replicate(5,1), "b"=replicate(9,3)),
+                   list("tGRADE"=c(NA,-1,-1),
+                        "tPRIMARY_SITE" = c(NA,-1,-1),
+                        "tRACE"=c(NA,-1),
+                        "theta"=replicate(5,-1),
+                        "b"=replicate(9,-3)))
+
+
+model_refit_loc_4 <- jags(data = data,
+                           parameters.to.save = c("tGRADE", "shape", "scale",
+                                                  "tPRIMARY_SITE","theta", "b",
+                                                  "loglik"),
+                           n.chains = 2,
+                           n.iter = 500,
+                           n.burnin = 10,
+                           n.thin = 5,
+                           model.file = "model_refit_3_2_female_mal.bug")
+
+weibull.paramlist.loc.4 <- model_refit_loc_4$BUGSoutput$sims.list
+weibull.loglik.loc.4 <- weibull.paramlist.loc.4$loglik
+weibull.waic.loc.4 <- waic(weibull.loglik.loc.4)
+print(weibull.waic.loc.4)
+
+# model_refit.loc.4 <- jags.model("model_refit_2_2_female_mal.bug", data=data,
+#                           inits=data_Inits, n.chains = 2)
+# update(model_refit.loc.4, 100)
+# dic_t_loc_4 <- dic.samples(model_refit.loc.4,
+#                      variable.names=c("tGRADE",
+#                                       "tRACE",
+#                                       "theta", "b", 
+#                                       "tPRIMARY_SITE","loglik"),
+#                      thin=10, n.burnin=100, n.iter=1000)
+# print(dic_t_loc_4)
+```
+
+Residuals:
+
+```{r eval=FALSE, include=FALSE}
+
+shape <- mean(weibull.paramlist$shape)
+scale_1 <- mean(weibull.paramlist$scale)
+
+# weibull.bSTAGE <- colMeans(weibull.paramlist$bSTAGE)
+# weibull.bEXTENSION <- mean(weibull.paramlist$beta)
+# weibull.bSTAGE_EXTENSION <- colMeans(weibull.paramlist$bSTAGE_EXTENSION)
+
+# weibull.tRACE <- colMeans(weibull.paramlist$tRACE)
+# weibull.tGRADE <- colMeans(weibull.paramlist$tGRADE)
+# weibull.tSTAGE <- colMeans(weibull.paramlist$tSTAGE)
+# weibull.tEXTENSION <- mean(weibull.paramlist$theta[,3])
+# weibull.tSIZE <- mean(weibull.paramlist$theta[,1])
+# weibull.tNODES <- mean(weibull.paramlist$theta[,2])
+# weibull.tSTAGE_EXTENSION <- colMeans(weibull.paramlist$tSTAGE_EXTENSION)
+
+s <- replicate(N,0)
+st <- replicate(N,0)
+st1 <- replicate(N,0)
+index <- replicate(N,0)
+ for (i in 1 :N) {
+  #   ### calculate 
+    
+  index[i] <- i
+  s[i] <- ifelse(is.censored[i], t.cen[i], t[i])
+  st1[i] <- -log(exp(-scale_1*(s[i]^shape)))
+ }
+
+tab <- cbind(index, st1, fbreast_no_rec_reg[1:N,]$STAGE, fbreast_no_rec_reg[1:N,]$CENSORING1)
+tab <- as.data.frame(tab)
+tab <- tab %>% arrange(st1)
+tab$V3 <- as.factor(tab$V3)
+colnames(tab)[3] <- "Stage"
+tab$V4 <- as.factor(tab$V4)
+colnames(tab)[4] <- "Censoring"
+
+tab$Stage <- factor(tab$Stage, levels = c(1,2,3), 
+                                labels = c("Localized", "Regional", "Distant"))
+tab$Censoring <- factor(tab$Censoring, levels = c(0,1), 
+                                labels = c("Censored", "Uncensored"))
+```
+
+
+```{r eval=FALSE, include=FALSE}
+library(pracma)
+plot(quantile(tab$st1, linspace(0, 1, dim(tab)[1])), quantile(tab$st1, linspace(0, 1, dim(tab)[1])),
+     xlab="Theoretical quantiles", ylab="Observed quantiles",
+     main="Cox-Snell Residuals",     pch=24)
+# qqline(tab$st1, distribution=qexp, col="blue", lty=2)
+abline(a=0, b=1, col="black", lty=24)
+abline(a=0, b=3.8, col="red", lty=24)
+
+
+
+# With OULTLIERS:
+
+ggplot(tab, aes(y=qexp(ppoints(dim(tab)[1])), x=st1)) +
+  geom_point(aes(shape=Censoring, color=Stage)) +
+  geom_abline(intercept=0.0, slope=1, color="black", linetype="dashed") +
+  geom_abline(intercept=0.0, slope=3.8, color="red", linetype="dashed") +
+  geom_abline(intercept=-2, slope=6.4, color="magenta", linetype="dashed") +
+  geom_segment(aes(x = 0.8, y = 0, xend = 0.8, yend = 3), color="#00AFBB") +
+  geom_segment(aes(x = 1.125, y = 0, xend = 1.125, yend = 5.3), color="#00AFBB") +
+  scale_shape_manual(values=c(3, 16)) +
+  scale_color_manual(values=c('steelblue','#E7B800', '#FC4E07', '#00AFBB')) +
+  theme_minimal() + ylab('Theoretical quantiles') + xlab('Observed quantiles')
+
+
+# survival estimate
+# plot(sort(s), exp(-tab$st1))
+
+```
+

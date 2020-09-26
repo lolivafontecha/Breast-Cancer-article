@@ -1,0 +1,444 @@
+---
+title: "A Breast Cancer Survability Study"
+output:
+  html_notebook:
+    theme: united
+    toc: yes
+  html_document:
+    df_print: paged
+    toc: yes
+---
+
+
+# I. Importing data and libraries
+
+
+```{r libraries and data import, message=FALSE, warning=FALSE, include=FALSE}
+library(corrplot) # for correlation plot
+library(RColorBrewer) # for plotting colors
+library(purrr) # for functionals
+library(MASS) # for chi-square
+library(dplyr) # for select, filter, summarize, etc.
+library(survival) # for survival analysis
+library(survminer) # for survival plots
+library(ggplot2) # for plots
+library(plotly) # for plots
+library(GGally) # for plots
+library(coda) # for convergence study of mcmc methods
+library(rjags)
+library(R2jags)
+library(loo) # to compute WAIC
+library(mice) # for imputation
+library(data.table) # for tables
+library(knitr) # for fancy tables display
+library(kableExtra) # for fancy tables display
+library(DataExplorer)
+library(usmap) # map plot
+library(rgdal)
+
+set.seed(20) # for reproducible example
+
+setwd("C:/Users/Luis/Desktop/TFG/final version")
+
+#dataset considering the recurrent cases
+breast_rec.ori <- read.table("Breast_cleaned_recurrence.csv", 
+                             sep = ",", header = TRUE)
+
+#dataset not considering the recurrent cases
+breast_no_rec.ori <- read.table("Breast_cleaned_no_recurrence.csv", 
+                                sep = ",", header = TRUE)
+
+coordinates <- read.table("mirecrack.csv",
+                          sep = ",", header = TRUE)
+```
+
+
+# II. Data cleaning and preparation
+
+```{r message=FALSE, warning=FALSE, include=FALSE}
+# re-ordering of the variables to differentiate quantitative and qualitative variables
+breast_no_rec.ori <- breast_no_rec.ori[, c(1,5,21:22,3,2,8:10,20,16,15,6:7,
+                                           4,11:12,14,13,17:19)] 
+breast_no_rec.ori$SEQ_NUM <- NULL # not really a predictor variable, just to check is not recurrent
+
+breast_no_rec <- breast_no_rec.ori # we keep the original dataset
+
+breast_no_rec$STATE <- factor(breast_no_rec$STATE, levels = c(9,26,15,19,35,6,49,53,13),
+                              labels = c("CONNECTICUT", "MICHIGAN", "HAWAII", "IOWA",
+                                         "NEW_MEXICO", "CALIFORNIA", "UTAH", 
+                                         "WASHINGTON", "GEORGIA"))
+breast_no_rec$RACE <- factor(breast_no_rec$RACE, levels = c(1,2,3), 
+                             labels = c("WHITE", "BLACK", "OTHER"))
+breast_no_rec$GENDER <- factor(breast_no_rec$GENDER, levels = c(1,2), 
+                               labels = c("MALE", "FEMALE"))
+breast_no_rec$BEHAVIOR <- factor(breast_no_rec$BEHAVIOR, levels = c(2,3), 
+                                 labels = c("NON_INVASIVE", "MALIGNANT"))
+breast_no_rec$LATERAL <- factor(breast_no_rec$LATERAL, levels = c(1,2,3,4), 
+                                labels = c("RIGHT", "LEFT", "ONE_SIDE", "BILATERAL"))
+breast_no_rec$STAGE <- factor(breast_no_rec$STAGE, levels = c(0,1,2,4), 
+                                labels = c("IN-SITU", "LOCALIZED", "REGIONAL", "DISTANT"))
+breast_no_rec$SURGERY <- factor(breast_no_rec$SURGERY, levels = c(0,1), 
+                                labels = c("YES", "NO"))
+breast_no_rec$GRADE <- factor(breast_no_rec$GRADE, levels = c(1,2,3,4),
+                              labels = c("WELL_DIFFERENTIATED", "MODERATELY_DIFFERENTIATED",
+                                         "POORLY_DIFFERENTIATED", "UNDIFFERENTIATED"))
+breast_no_rec$DEATH <- factor(breast_no_rec$DEATH, levels = c(0,1,8), 
+                              labels = c("OTHER_OR_ALIVE", "CANCER",
+                                         "UNKNOWN_REASON"))
+breast_no_rec$VITAL_STAT <- factor(breast_no_rec$VITAL_STAT, levels = c(0,1),
+                                   labels = c("DEAD", "ALIVE"))
+
+# breast_no_rec <- breast_no_rec %>% filter(!(VITAL_STAT=="DEAD" & DEATH=="OTHER_OR_ALIVE"))
+
+# as.factor for categoric variables
+breast_no_rec$STATE_COUNTY <- as.factor(breast_no_rec$STATE_COUNTY)
+breast_no_rec$STATE <- as.factor(breast_no_rec$STATE)
+breast_no_rec$RACE <- as.factor(breast_no_rec$RACE)
+breast_no_rec$GENDER <- as.factor(breast_no_rec$GENDER)
+breast_no_rec$PRIMARY_SITE <- as.factor(breast_no_rec$PRIMARY_SITE)
+breast_no_rec$LATERAL <- as.factor(breast_no_rec$LATERAL)
+breast_no_rec$BEHAVIOR <- as.factor(breast_no_rec$BEHAVIOR)
+breast_no_rec$STAGE <- as.factor(breast_no_rec$STAGE)
+breast_no_rec$SURGERY <- as.factor(breast_no_rec$SURGERY)
+breast_no_rec$GRADE <- as.factor(breast_no_rec$GRADE)
+breast_no_rec$VITAL_STAT <- as.factor(breast_no_rec$VITAL_STAT)
+breast_no_rec$DEATH <- as.factor(breast_no_rec$DEATH)
+
+# we drop, for the moment, the county of the patient
+breast_no_rec$COUNTY <- NULL
+# we also drop the patient id for privacy ethics
+breast_no_rec$PATIENT_ID <- NULL
+
+# CENSORING, NODES AND Y creation
+cens_funct <- function(x,y) {
+  if ((x == "DEAD") & (y == "CANCER")) {
+    # dead and because of cancer
+    return(1)
+  }
+    return(0)
+}
+
+zero_funct <- function(x) {
+  if (x == 0) {
+    return(1)
+  }
+  return(0)
+}
+
+nod_funct <- function(x,y) {
+  if(y == 0) {
+    return(0)
+  } else {
+    return(x/y)
+  }
+}
+
+# we replace nod_ex and nod_pos by their ratio
+breast_no_rec <- breast_no_rec %>% mutate(NODES = map2_dbl(NOD_POS, NOD_EX, nod_funct))
+
+# we create the censoring column
+breast_no_rec <- breast_no_rec %>% mutate(CENSORING = map2_dbl(VITAL_STAT, DEATH, cens_funct))
+
+# we create the Y variable: indicator of 0 survival months
+breast_no_rec <- breast_no_rec %>% mutate(Y = map_dbl(SURVIVAL_MONTHS, zero_funct))
+
+breast_no_rec$VITAL_STAT <- NULL # not useful anymore
+breast_no_rec$DEATH <- NULL # not useful anymore
+breast_no_rec$NOD_EX <- NULL # not useful anymore
+breast_no_rec$NOD_POS <- NULL # not useful anymore
+
+# we are just dropping 102 cases out of 394639 cases
+breast_no_rec <- breast_no_rec %>% filter(LATERAL != "ONE_SIDE" & LATERAL != "BILATERAL") 
+breast_no_rec$LATERAL <- droplevels(breast_no_rec$LATERAL)
+
+# re-ordering of the variables
+breast_no_rec <- breast_no_rec[, c(1:14, 16, 15, 17:18)]
+
+# we only keep malignant tumors which have undergone surgery
+breast_no_rec <- breast_no_rec %>% filter(BEHAVIOR=="MALIGNANT" & SURGERY=="YES")
+breast_no_rec$BEHAVIOR <- NULL
+breast_no_rec$SURGERY <- NULL
+breast_no_rec$STAGE <- droplevels(breast_no_rec$STAGE)
+
+breast_no_rec$STATE_COUNTY <- NULL
+
+# deleting instances wih extreme values for tumor size and female
+breast_no_rec <- breast_no_rec %>% filter(GENDER =="MALE" | (GENDER=="FEMALE" & SIZE <= 200))
+
+# separating by gender
+fbreast_no_rec <- breast_no_rec %>% filter(GENDER == "FEMALE")
+
+mbreast_no_rec <- breast_no_rec %>% filter(GENDER == "MALE")
+
+# imputation para valores erroneos of tumor size
+mbreast_no_rec$SIZE[mbreast_no_rec$SIZE > 200] <- NA
+mbmice <- mice(mbreast_no_rec[,c(1:12)], method="pmm")
+mbreast_no_rec_copy <- complete(mbmice, include=FALSE)
+mbreast_no_rec <- cbind(mbreast_no_rec_copy,
+                        mbreast_no_rec[,13:15])
+```
+
+
+Merging Categories: (RACE, PRIMARY SITE, GRADE
+```{r}
+mbreast_no_rec$RACE <- factor(mbreast_no_rec$RACE, 
+                              levels = c("WHITE","BLACK", "OTHER"), 
+                              labels = c("WHITE", "OTHER", "OTHER"))
+fbreast_no_rec$RACE <- factor(fbreast_no_rec$RACE, 
+                              levels = c("WHITE","BLACK", "OTHER"), 
+                              labels = c("WHITE", "OTHER", "OTHER"))
+
+mbreast_no_rec$PRIMARY_SITE <- factor(mbreast_no_rec$PRIMARY_SITE, 
+                                   levels = c("C500", "C501", "C502",
+                                              "C503", "C504", "C505",
+                                              "C506", "C508","C509"),
+                                   labels = c("OTHER", "C501", "OTHER", 
+                                              "OTHER", "OTHER", "OTHER",
+                                              "OTHER", "C508", "C509"))
+
+fbreast_no_rec$PRIMARY_SITE <- factor(fbreast_no_rec$PRIMARY_SITE, 
+                                   levels = c("C500", "C501", "C502",
+                                              "C503", "C504", "C505",
+                                              "C506", "C508","C509"),
+                                   labels = c("OTHER", "OTHER", "OTHER", 
+                                              "OTHER", "C504", "OTHER",
+                                              "OTHER", "C508", "C509"))
+
+mbreast_no_rec$GRADE <- factor(mbreast_no_rec$GRADE, 
+                               levels = c("WELL_DIFFERENTIATED",
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY_DIFFERENTIATED",
+                                          "UNDIFFERENTIATED"), 
+                               labels = c("WELL_DIFFERENTIATED", 
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED"))
+
+fbreast_no_rec$GRADE <- factor(fbreast_no_rec$GRADE, 
+                               levels = c("WELL_DIFFERENTIATED",
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY_DIFFERENTIATED",
+                                          "UNDIFFERENTIATED"), 
+                               labels = c("WELL_DIFFERENTIATED", 
+                                          "MODERATELY_DIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED",
+                                          "POORLY/UNDIFFERENTIATED"))
+
+prova <- rbind(fbreast_no_rec, mbreast_no_rec)
+fbreast_no_rec$GENDER <- NULL
+mbreast_no_rec$GENDER <- NULL
+```
+
+# III. Female model fitting
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# centrate diagnostic year
+fbreast_no_rec$DIAGNOSTIC_YEAR <- fbreast_no_rec$DIAGNOSTIC_YEAR - mean(fbreast_no_rec$DIAGNOSTIC_YEAR)
+
+# log transformation for age, EXTENSIONsion and tumor size
+fbreast_no_rec$SIZE <- log(fbreast_no_rec$SIZE + 1) # + 1 because of the values = 0
+fbreast_no_rec$EXTENSION <- log(fbreast_no_rec$EXTENSION + 1) # + 1 because of the values = 0
+fbreast_no_rec$AGE <- log(fbreast_no_rec$AGE)
+
+fbreast_no_rec$CENSORING1 <- fbreast_no_rec$CENSORING
+fbreast_no_rec <- fbreast_no_rec %>% arrange(STATE)
+
+is.censored <- 1 - fbreast_no_rec$CENSORING
+
+fbreast_no_rec$CENSORING[fbreast_no_rec$CENSORING == 1] <- fbreast_no_rec$SURVIVAL_MONTHS[fbreast_no_rec$CENSORING == 1] + 1
+mcopia <- fbreast_no_rec$SURVIVAL_MONTHS[fbreast_no_rec$CENSORING == 0] 
+fbreast_no_rec$SURVIVAL_MONTHS[fbreast_no_rec$CENSORING == 0] <- NA
+fbreast_no_rec$CENSORING[fbreast_no_rec$CENSORING == 0] <- mcopia
+
+t <- fbreast_no_rec$SURVIVAL_MONTHS
+t.cen <- fbreast_no_rec$CENSORING
+
+# K <- dim(fbreast_no_rec %>% filter(Y==0))[1]
+load.module("glm")
+attach(fbreast_no_rec)
+N <- nrow(fbreast_no_rec)
+```
+
+```{r}
+IND <- c(0, 46221, 93875, 110115, 148535, 167661, 220967, 241064, 297142, K)
+INDR <- c(K, 329178, 329248, 329268, 329320, 329367, 329411, 329433, 329473, N)
+```
+
+Univariate models:
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, paged.print=TRUE}
+# RACE
+data <-list("Y"=Y, "RACE"=RACE, "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+data_Inits <- list(list("bRACE"=c(NA,3), "tRACE"=c(NA,1), "beta"=3, "theta"=1),
+                   list("bRACE"=c(NA,-3), "tRACE"=c(NA,-1), "beta"=-3, "theta"=-1))
+
+model_race <- jags.model("model_race.bug", data = data, inits=data_Inits, n.chains=2)
+update(model_race, 1000)
+samples_race <- coda.samples(model_race,
+                        variable.names=c("bRACE", "tRACE", "beta", "theta"),
+                        thin=100, n.burnin=2000, n.iter=10000)
+
+summary(samples_race)
+
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# PRIMARY SITE
+data <-list("Y"=Y, "PRIM_SITE"=PRIMARY_SITE, "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+data_Inits <- list(list("bPRIM_SITE"=c(NA,3,3,3), 
+                        "tPRIM_SITE"=c(NA,1,1,1), "beta"=3, "theta"=1),
+                   list("bPRIM_SITE"=c(NA,-3,-3,-3), "tPRIM_SITE"=c(NA,-1,-1,-1), "beta"=-3, "theta"=-1))
+
+model_PRIMARY_SITE <- jags.model("model_prim_site_2.bug", data = data, inits=data_Inits, n.chains=2)
+update(model_PRIMARY_SITE, 1000)
+samples_PRIMARY_SITE <- coda.samples(model_PRIMARY_SITE,
+                        variable.names=c("bPRIM_SITE", "tPRIM_SITE", "beta", "theta"),
+                        thin=100, n.burnin=2000, n.iter=10000)
+
+summary(samples_PRIMARY_SITE)
+
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# LATERAL
+data <-list("Y"=Y, "LATERAL"=LATERAL, "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+data_Inits <- list(list("bLATERAL"=c(NA,3), "tLATERAL"=c(NA,1), "beta"=3, "theta"=1),
+                   list("bLATERAL"=c(NA,-3), "tLATERAL"=c(NA,-1), "beta"=-3, "theta"=-1))
+
+model_lateral <- jags.model("model_lateral.bug", data = data, inits=data_Inits, n.chains=2)
+update(model_lateral, 1000)
+samples_lateral <- coda.samples(model_lateral,
+                        variable.names=c("bLATERAL", "tLATERAL", "beta", "theta"),
+                        thin=100, n.burnin=2000, n.iter=10000)
+
+summary(samples_lateral)
+
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# Stage
+data <-list("Y"=Y, "PRIM_SITE"=STAGE, "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+data_Inits <- list(list("bPRIM_SITE"=c(NA,3,3), "tPRIM_SITE"=c(NA,1,1), "beta"=3, "theta"=1),
+                   list("bPRIM_SITE"=c(NA,-3,-3), "tPRIM_SITE"=c(NA,-1,-1), "beta"=-3, "theta"=-1))
+
+model_PRIMARY_SITE <- jags.model("model_prim_site.bug", data = data, inits=data_Inits, n.chains=2)
+update(model_PRIMARY_SITE, 1000)
+samples_PRIMARY_SITE <- coda.samples(model_PRIMARY_SITE,
+                        variable.names=c("bPRIM_SITE", "tPRIM_SITE", "beta", "theta"),
+                        thin=30, n.burnin=2000, n.iter=10000)
+
+summary(samples_PRIMARY_SITE)
+
+#-------------------------------------------------------------------------------
+#-------------------------------------------------------------------------------
+
+# GRADE
+data <-list("Y"=Y, "PRIM_SITE"=GRADE, "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+data_Inits <- list(list("bPRIM_SITE"=c(NA,3,3), "tPRIM_SITE"=c(NA,1,1), "beta"=3, "theta"=1),
+                   list("bPRIM_SITE"=c(NA,-3,-3), "tPRIM_SITE"=c(NA,-1,-1), "beta"=-3, "theta"=-1))
+
+model_PRIMARY_SITE <- jags.model("model_prim_site.bug", data = data, inits=data_Inits, n.chains=2)
+update(model_PRIMARY_SITE, 1000)
+samples_PRIMARY_SITE <- coda.samples(model_PRIMARY_SITE,
+                        variable.names=c("bPRIM_SITE", "tPRIM_SITE", "beta", "theta"),
+                        thin=30, n.burnin=2000, n.iter=15000)
+
+summary(samples_PRIMARY_SITE)
+
+# CONTINUOUS: DIAGNOSTIC YEAR, AGE, TUMOR SIZE, EXTENSIONSION & NODES
+for (i in 7:11) { 
+    name <- colnames(fbreast_no_rec)[i]
+    cat(name, ": \n")
+
+    data <-list("Y"=Y, "VAR"=mbreast_no_rec[,i], "N"=N, "K"=K, "t"=t, "t.cen"=t.cen, "is.censored"=is.censored)
+
+    data_Inits <- list(list("beta"=3, "theta"=3, "beta_zero"=3, "theta_zero"=1),
+                       list("beta"=-3, "theta"=-3, "beta_zero"=-3, "theta_zero"=-1))
+
+    model <- jags.model("model_continous.bug", data = data, inits=data_Inits, n.chains=2)
+    update(model, 100)
+    samples <- coda.samples(model,
+                            variable.names=c("beta", "theta", "beta_zero", "theta_zero"),
+                            thin=5, n.burnin=500, n.iter=3000)
+
+    print(summary(samples))
+}
+```
+
+Final model:
+```{r}
+data <-list("Y"=Y, "RACE"=RACE, "PRIMARY_SITE"=PRIMARY_SITE,
+            "STAGE_t"=STAGE_t, "GRADE_t"=GRADE_t, "PRIMARY_SITE_t"=PRIMARY_SITE_t,
+            "STAGE"=STAGE, "GRADE"=GRADE, "EXTENSION"=EXTENSION, 
+            "SIZE"=SIZE, "AGE"=AGE, "NODES"=NODES, "is.censored"=is.censored,
+            "IND"=IND, "INDR"=INDR, "t"=t, "t.cen"=t.cen)
+
+
+model_refit <- jags(data = data,
+                           parameters.to.save = c("bSTAGE", "bGRADE", "bPRIMARY_SITE", "beta",
+                                                  "tRACE", "tGRADE", "tSTAGE", "tPRIMARY_SITE", "theta",
+                                                  "shape", "scale", "b", "loglik", "p"),
+                           n.chains = 2,
+                           n.iter = 2000,
+                           n.burnin = 300,
+                           n.thin = 10,
+                           model.file = "model_refit_1_female_mal.bug")
+
+weibull.paramlist <- model_refit$BUGSoutput$sims.list
+weibull.loglik <- weibull.paramlist$loglik
+weibull.waic <- waic(weibull.loglik)
+print(weibull.waic)
+
+
+```
+Residuals:
+```{r}
+
+shape <- mean(weibull.paramlist$shape)
+p_1 <- mean(weibull.paramlist$p)
+scale_1 <- mean(weibull.paramlist$scale)
+
+s <- replicate(K,0)
+st1 <- replicate(K,0)
+index <- replicate(K,0)
+
+ for (i in 1 :K) {
+  index[i] <- i
+  s[i] <- ifelse(is.censored[i], t.cen[i], t[i])
+  st1[i] <- -log(exp(-scale_1*(s[i]^shape))*(1-p_1))
+ }
+
+tab <- cbind(index, st1, fbreast_no_rec$STAGE[1:K], fbreast_no_rec$CENSORING1[1:K])
+tab <- as.data.frame(tab)
+tab <- tab %>% arrange(st1)
+tab$V3 <- as.factor(tab$V3)
+colnames(tab)[3] <- "Stage"
+tab$V4 <- as.factor(tab$V4)
+colnames(tab)[4] <- "Censoring"
+
+tab$Stage <- factor(tab$Stage, levels = c(1,2,3), 
+                                labels = c("Localized", "Regional", "Distant"))
+tab$Censoring <- factor(tab$Censoring, levels = c(0,1), 
+                                labels = c("Censored", "Uncensored"))
+
+ggplot(tab, aes(y=qexp(ppoints(dim(tab)[1])), x=st1)) +
+  geom_point(aes(shape=Censoring, color="#00AFBB")) +
+  geom_abline(intercept=0.0, slope=1, color="black", linetype="dashed") +
+  geom_abline(intercept=-0.49, slope=5.3, color="red", linetype="dashed") +
+  geom_segment(aes(x = 0.42, y = 0, xend = 0.42, yend = 1.8), color="#00AFBB") +
+  scale_shape_manual(values=c(3, 16)) +
+  guides(colour = FALSE) +
+  scale_color_manual(values=c('steelblue','#E7B800', '#FC4E07', '#00AFBB')) +
+  theme_minimal() + ylab('Theoretical quantiles') + xlab('Observed quantiles')
+
+
+# survival estimate
+# plot(sort(s), exp(-tab$st1))
+
+```
+
